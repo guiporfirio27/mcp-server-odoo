@@ -1,0 +1,4 @@
+mcp-server-odoo
+fastapi
+uvicorn
+httpx
