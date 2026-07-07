@@ -1,12 +1,16 @@
 """
 Proxy MCP server com OAuth 2.0 completo para Claude.ai
-Suporte a streaming (SSE/chunked)
+Suporte a streaming (SSE/chunked) com debug
 """
 import os
 import httpx
+import logging
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 import uvicorn
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -31,6 +35,7 @@ async def oauth_metadata():
 @app.post("/oauth/register")
 async def oauth_register(request: Request):
     body = await request.json()
+    logger.debug(f"REGISTER: {body}")
     return JSONResponse({
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
@@ -44,6 +49,7 @@ async def oauth_register(request: Request):
 @app.get("/oauth/authorize")
 async def oauth_authorize(request: Request):
     params = dict(request.query_params)
+    logger.debug(f"AUTHORIZE params: {params}")
     redirect_uri = params.get("redirect_uri", "")
     state = params.get("state", "")
     code = "gp-auth-code-2026"
@@ -51,6 +57,8 @@ async def oauth_authorize(request: Request):
 
 @app.post("/oauth/token")
 async def oauth_token(request: Request):
+    body = await request.body()
+    logger.debug(f"TOKEN request: {body}")
     return JSONResponse({
         "access_token": BEARER_TOKEN,
         "token_type": "bearer",
@@ -66,6 +74,9 @@ async def health():
 @app.api_route("/mcp/{path:path}", methods=["GET", "POST", "DELETE", "PUT"])
 async def proxy_mcp(request: Request, path: str = ""):
     auth = request.headers.get("Authorization", "")
+    logger.debug(f"MCP request: method={request.method} path={path} auth={auth[:20] if auth else 'none'}")
+    logger.debug(f"MCP headers: {dict(request.headers)}")
+    
     if not auth.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -74,12 +85,13 @@ async def proxy_mcp(request: Request, path: str = ""):
         internal_url = f"http://localhost:8001/mcp/{path}"
 
     body = await request.body()
+    logger.debug(f"MCP body: {body[:500] if body else 'empty'}")
+    
     headers = {k: v for k, v in request.headers.items() 
                if k.lower() not in ["host", "authorization", "content-length"]}
 
-    # Usar streaming para suportar SSE e chunked responses
-    async def stream_response():
-        async with httpx.AsyncClient(timeout=120) as client:
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
             async with client.stream(
                 method=request.method,
                 url=internal_url,
@@ -87,28 +99,20 @@ async def proxy_mcp(request: Request, path: str = ""):
                 content=body,
                 params=dict(request.query_params)
             ) as resp:
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
+                logger.debug(f"Internal response: status={resp.status_code} headers={dict(resp.headers)}")
+                response_headers = dict(resp.headers)
+                response_headers.pop("content-length", None)
+                response_headers.pop("transfer-encoding", None)
 
-    # Fazer primeira requisição para pegar headers de resposta
-    async with httpx.AsyncClient(timeout=30) as client:
-        async with client.stream(
-            method=request.method,
-            url=internal_url,
-            headers=headers,
-            content=body,
-            params=dict(request.query_params)
-        ) as resp:
-            response_headers = dict(resp.headers)
-            response_headers.pop("content-length", None)
-            status_code = resp.status_code
-
-            return StreamingResponse(
-                resp.aiter_bytes(),
-                status_code=status_code,
-                headers=response_headers,
-                media_type=response_headers.get("content-type", "application/json")
-            )
+                return StreamingResponse(
+                    resp.aiter_bytes(),
+                    status_code=resp.status_code,
+                    headers=response_headers,
+                    media_type=response_headers.get("content-type", "application/json")
+                )
+    except Exception as e:
+        logger.error(f"Proxy error: {e}")
+        raise HTTPException(status_code=502, detail=str(e))
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="debug")
